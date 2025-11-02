@@ -9,6 +9,7 @@ import { nanoid } from 'nanoid';
 import dotenv from 'dotenv';
 import mime from 'mime';
 
+
 dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,11 +28,14 @@ app.use(cors({ origin: true }));
 app.use(express.json());
 
 const upload = multer({
-  dest: UPLOAD_DIR,
-  limits: { fileSize: 15 * 1024 * 1024 }, // 15 MB
+  dest: UPLOAD_DIR,                             // auto uses tmp filenames
+  limits: { fileSize: 15 * 1024 * 1024 },       // 15MB
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === 'application/pdf' || path.extname(file.originalname).toLowerCase() === '.pdf') cb(null, true);
-    else cb(new Error('Only PDF files are allowed'));
+    const isPdf =
+      file.mimetype === 'application/pdf' ||
+      (path.extname(file.originalname).toLowerCase() === '.pdf');
+    if (!isPdf) return cb(new Error('Only PDF files are allowed'));
+    cb(null, true);
   }
 });
 
@@ -43,19 +47,53 @@ function requireAdmin(req, res, next) {
 }
 
 async function readDB() {
-  const data = await fsp.readFile(DB_PATH, 'utf8');
-  return JSON.parse(data);
+  try {
+    const buf = await fsp.readFile(DB_PATH);
+    let txt = buf.toString('utf8');
+
+    // strip BOM & control chars that sometimes sneak in on Windows
+    txt = txt.replace(/^\uFEFF/, '').replace(/[\u0000-\u001F]+/g, '').trim();
+
+    // if empty, treat as []
+    if (txt.length === 0) {
+      await writeDB([]);
+      return [];
+    }
+
+    // handle the common mistake: file contains the literal string "[]"
+    // (with quotes) or smart quotes
+    if (/^["“”']\s*\[\s*]\s*["“”']$/.test(txt)) {
+      txt = '[]';
+    }
+
+    const parsed = JSON.parse(txt);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (e) {
+    // file missing or invalid -> reinitialize
+    await writeDB([]);
+    return [];
+  }
 }
 async function writeDB(list) {
-  await fsp.writeFile(DB_PATH, JSON.stringify(list, null, 2), 'utf8');
+  const txt = JSON.stringify(Array.isArray(list) ? list : [], null, 2);
+  await fsp.writeFile(DB_PATH, txt, { encoding: 'utf8' });
 }
 
 app.post('/api/upload', requireAdmin, upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ error: 'No file' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
     const id = nanoid(10);
-    const newName = id + '.pdf';
-    await fsp.rename(req.file.path, path.join(UPLOAD_DIR, newName));
+    const src = req.file.path;                      // temp file path from multer
+    const dest = path.join(UPLOAD_DIR, id + '.pdf');
+
+    // Extra: verify uploaded tmp file actually exists
+    if (!fs.existsSync(src)) {
+      console.error('Uploaded temp file not found:', src);
+      return res.status(500).json({ error: 'Temp file missing' });
+    }
+
+    await fsp.rename(src, dest);
 
     const entry = {
       id,
@@ -63,16 +101,18 @@ app.post('/api/upload', requireAdmin, upload.single('file'), async (req, res) =>
       size: req.file.size,
       uploadedAt: new Date().toISOString()
     };
-    const list = await readDB();
+
+    const list = await readDB();        // if files.json got corrupted, this throws
     list.unshift(entry);
     await writeDB(list);
 
     res.json({ ok: true, file: entry });
   } catch (e) {
-    console.error(e);
+    console.error('UPLOAD_ERROR:', e);
     res.status(500).json({ error: 'Upload failed' });
   }
 });
+
 
 app.get('/api/files', async (req, res) => {
   const list = await readDB();
